@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ia-sandbox: roda o OpenClaude num container, em um clone isolado do projeto.
+#   ia-sandbox build                         constrói a imagem
+#   ia-sandbox check                         testa se o container alcança o Ollama do host
+#   ia-sandbox run [projeto]                 clona o projeto e abre o OpenClaude (interativo)
+#   ia-sandbox overnight <projeto> "<meta>"  roda /tdd sem ninguém, com limite de tempo
+#   ia-sandbox pull <clone>                  confere o travamento dos testes e traz a branch
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SRC="$(cd "$(dirname "$SELF")/.." && pwd)"
+IMAGE="${IA_IMAGE:-ia-team-sandbox}"
+WORK_ROOT="${IA_WORK_ROOT:-$HOME/.ia-sandbox}"
+OLLAMA_URL="${OLLAMA_URL:-http://host.docker.internal:11434/v1}"
+MODEL="${IA_MODEL:-deepseek-v4.1-flash:cloud}"
+TEAM="${IA_TEAM:-ollama}"
+HOSTARG=(--add-host host.docker.internal:host-gateway)
+CLONE=""
+DARGS=()
+
+cmd_build() {
+  docker build -t "$IMAGE" "$SRC/sandbox"
+}
+
+cmd_check() {
+  echo "Testando $OLLAMA_URL de dentro do container (esperado: 200)..."
+  docker run --rm "${HOSTARG[@]}" --entrypoint curl "$IMAGE" \
+    -sS -m 8 -o /dev/null -w '%{http_code}\n' "$OLLAMA_URL/models" \
+    || echo "FALHOU: o container não alcançou o Ollama."
+}
+
+# Cria o clone isolado e grava os metadados fora da pasta montada. Define $CLONE.
+prepare_clone() {
+  local proj name
+  proj="$(cd "${1:-.}" && git rev-parse --show-toplevel)"
+  if [ -n "$(git -C "$proj" status --porcelain)" ]; then
+    echo "O projeto tem mudanças não commitadas. Commite ou guarde antes."
+    exit 1
+  fi
+  name="$(basename "$proj")"
+  CLONE="$WORK_ROOT/$name-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$WORK_ROOT"
+  # Clone sem hardlinks e sem remote: o agente não alcança o repo original.
+  git clone --quiet --no-hardlinks "$proj" "$CLONE"
+  git -C "$CLONE" remote remove origin
+  git -C "$CLONE" rev-parse HEAD > "$CLONE.base"
+  echo "$proj" > "$CLONE.proj"
+}
+
+# Monta os argumentos comuns do docker run em $DARGS (usa $CLONE).
+build_args() {
+  DARGS=(
+    --user "$(id -u):$(id -g)"
+    --cap-drop ALL --security-opt no-new-privileges
+    --memory 4g --cpus 2 --pids-limit 512
+    "${HOSTARG[@]}"
+    --tmpfs "/home/dev:rw,exec,uid=$(id -u),gid=$(id -g),mode=700"
+    -e HOME=/home/dev -e TEAM="$TEAM"
+    -e CLAUDE_CODE_USE_OPENAI=1
+    -e OPENAI_BASE_URL="$OLLAMA_URL"
+    -e OPENAI_MODEL="$MODEL"
+    -v "$CLONE:/work" -v "$SRC:/ia-team:ro"
+  )
+}
+
+cmd_run() {
+  prepare_clone "${1:-.}"
+  build_args
+  echo "Clone isolado: $CLONE"
+  docker run --rm -it "${DARGS[@]}" "$IMAGE" openclaude || true
+  echo
+  echo "Saiu do container. Para conferir e trazer o trabalho:"
+  echo "  $SELF pull $CLONE"
+}
+
+cmd_overnight() {
+  local projarg="${1:?uso: ia-sandbox overnight <projeto> \"<objetivo>\"}"
+  shift
+  local goal="${*:?informe o objetivo entre aspas}"
+  local hours="${IA_MAX_HOURS:-8}"
+  prepare_clone "$projarg"
+  build_args
+  local log="$CLONE.log"
+  local inhibit=()
+  # Só usa o inhibit se ele funcionar de verdade; senão roda sem (e avisa).
+  if command -v systemd-inhibit >/dev/null 2>&1 \
+     && systemd-inhibit --what=sleep:idle --who=ia-sandbox --why=teste true >/dev/null 2>&1; then
+    inhibit=(systemd-inhibit --what=sleep:idle --who=ia-sandbox --why="agente rodando")
+  else
+    echo "AVISO: não consegui impedir a suspensão do PC. Desative a suspensão manualmente."
+  fi
+
+  echo "Objetivo : $goal"
+  echo "Clone    : $CLONE"
+  echo "Log      : $log"
+  echo "Limite   : ${hours}h"
+  echo "Início   : $(date '+%F %T')"
+  echo "Acompanhar de fora:  git -C $CLONE log --oneline"
+  echo
+
+  # Sem TTY e sem stdin: comando não liberado é negado em vez de ficar esperando resposta.
+  "${inhibit[@]}" docker run --rm "${DARGS[@]}" "$IMAGE" \
+    timeout "${hours}h" openclaude -p "/tdd $goal" </dev/null 2>&1 | tee "$log" || true
+
+  echo
+  echo "Fim: $(date '+%F %T')"
+  echo "Commits do clone:"
+  git -C "$CLONE" log --oneline "$(cat "$CLONE.base")..HEAD" || true
+  echo
+  echo "Progresso do agente: $CLONE/.auto/progresso.md"
+  echo "Para conferir e trazer o trabalho:"
+  echo "  $SELF pull $CLONE"
+}
+
+cmd_pull() {
+  local clone="${1:?informe o clone}"
+  clone="$(cd "$clone" && pwd)"
+  [ -f "$clone.base" ] && [ -f "$clone.proj" ] || { echo "Metadados não encontrados ($clone.base / .proj)."; exit 1; }
+
+  local base proj branch
+  base="$(cat "$clone.base")"
+  proj="$(cat "$clone.proj")"
+  branch="$(git -C "$clone" branch --show-current)"
+  case "$branch" in
+    ""|main|master) echo "REPROVADO: o trabalho não está numa branch própria (atual: '${branch:-detached}')."; exit 1 ;;
+  esac
+
+  declare -A locked=()
+  local spec_seen=0 bad=0 sha subj f
+  while read -r sha; do
+    subj="$(git -C "$clone" log -1 --format=%s "$sha")"
+    if [[ "$subj" == spec:* ]]; then
+      spec_seen=1
+      while IFS= read -r f; do [ -n "$f" ] && locked["$f"]=1; done \
+        < <(git -C "$clone" diff-tree --no-commit-id --name-only -r "$sha")
+    else
+      while IFS= read -r f; do
+        if [ -n "$f" ] && [ -n "${locked[$f]:-}" ]; then
+          echo "VIOLAÇÃO: commit ${sha:0:8} ('$subj') altera teste travado: $f"
+          bad=1
+        fi
+      done < <(git -C "$clone" diff-tree --no-commit-id --name-only -r "$sha")
+    fi
+  done < <(git -C "$clone" rev-list --reverse "$base..$branch")
+
+  # Mudanças não commitadas em teste travado também contam.
+  for f in "${!locked[@]}"; do
+    if ! git -C "$clone" diff --quiet HEAD -- "$f" 2>/dev/null; then
+      echo "VIOLAÇÃO: teste travado com mudança não commitada: $f"
+      bad=1
+    fi
+  done
+
+  if [ "$spec_seen" -eq 0 ] && [ "${IA_ALLOW_NO_SPEC:-0}" != "1" ]; then
+    echo "REPROVADO: nenhum commit 'spec:' na branch (o fluxo de testes travados não foi seguido)."
+    echo "Se isso é esperado, rode com IA_ALLOW_NO_SPEC=1."
+    exit 1
+  fi
+  [ "$bad" -eq 0 ] || { echo "REPROVADO: testes travados foram alterados."; exit 1; }
+
+  if [ -n "$(git -C "$clone" status --porcelain)" ]; then
+    echo "AVISO: há mudanças não commitadas no clone; elas NÃO serão trazidas."
+  fi
+
+  git -C "$proj" fetch --quiet "$clone" "$branch:$branch"
+  echo "APROVADO NO TRAVAMENTO. Branch '$branch' trazida para $proj"
+  echo "Commits:"
+  git -C "$proj" log --oneline "$base..$branch"
+  echo
+  echo "Revise com:  git -C $proj diff $base..$branch"
+  echo "Rode os testes você mesmo antes do merge."
+}
+
+case "${1:-}" in
+  build)     cmd_build ;;
+  check)     cmd_check ;;
+  run)       shift; cmd_run "$@" ;;
+  overnight) shift; cmd_overnight "$@" ;;
+  pull)      shift; cmd_pull "$@" ;;
+  *) sed -n '2,8p' "$SELF"; exit 1 ;;
+esac
