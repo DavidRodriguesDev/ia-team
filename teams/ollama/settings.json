@@ -1,0 +1,72 @@
+{
+  "env": {},
+  "model": "deepseek-v4.1-flash:cloud",
+  "agentModels": {
+    "lead": {
+      "model": "kimi-k3.1-pro:cloud"
+    },
+    "dev": {
+      "model": "deepseek-v4.1-flash:cloud"
+    },
+    "aux": {
+      "model": "glm-5.3-flash:cloud"
+    }
+  },
+  "agentRouting": {
+    "Plan": "lead",
+    "reviewer": "lead",
+    "verification": "lead",
+    "Explore": "aux",
+    "tester": "aux",
+    "general-purpose": "dev",
+    "default": "dev",
+    "spec-writer": "lead"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cat:*)",
+      "Bash(echo:*)",
+      "Bash(find:*)",
+      "Bash(git add:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git commit:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git restore:*)",
+      "Bash(git show:*)",
+      "Bash(git status:*)",
+      "Bash(git switch:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(node:*)",
+      "Bash(npm --prefix:*)",
+      "Bash(npm ci:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(pwd:*)",
+      "Bash(tail:*)",
+      "Bash(touch:*)",
+      "Bash(wc:*)"
+    ],
+    "deny": [
+      "Bash(git -C:*)",
+      "Bash(git branch -D:*)",
+      "Bash(git clean:*)",
+      "Bash(git commit --amend:*)",
+      "Bash(git push:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(rm -rf:*)",
+      "Bash(sudo:*)",
+      "Read(./.env)"
+    ],
+    "defaultMode": "acceptEdits"
+  }
+}
