@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Uso: bash install.sh [time]   (padrão: ollama)
+# Feche o OpenClaude antes de rodar: ele regrava ~/.openclaude.json ao sair.
 set -euo pipefail
 shopt -s nullglob
 
@@ -19,7 +20,7 @@ if grep -Eq '"model"[[:space:]]*:[[:space:]]*"[^"]* [^"]*"' "$CFG"; then
   exit 1
 fi
 
-mkdir -p "$DEST/agents"
+mkdir -p "$DEST/agents" "$DEST/commands"
 
 if [ -f "$DEST/settings.json" ]; then
   cp "$DEST/settings.json" "$DEST/settings.json.bak.$TS"
@@ -27,18 +28,62 @@ fi
 cp "$CFG" "$DEST/settings.json"
 chmod 600 "$DEST/settings.json"
 
-# Agentes: symlink. Se já existir um arquivo comum com o mesmo nome, guarda backup.
-AGENTS=("$SRC"/agents/*.md)
-[ ${#AGENTS[@]} -gt 0 ] || echo "AVISO: nenhum agente em $SRC/agents"
-for f in "${AGENTS[@]}"; do
-  target="$DEST/agents/$(basename "$f")"
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
-    mv "$target" "$target.bak.$TS"
-  fi
-  ln -sf "$f" "$target"
-done
+# Agentes e comandos: symlink. Se já existir um arquivo comum com o mesmo nome, guarda backup.
+link_folder() {
+  local from="$1" to="$2" f target
+  local files=("$from"/*.md)
+  [ ${#files[@]} -gt 0 ] || { echo "AVISO: nenhum arquivo em $from"; return 0; }
+  for f in "${files[@]}"; do
+    target="$to/$(basename "$f")"
+    if [ -e "$target" ] && [ ! -L "$target" ]; then
+      mv "$target" "$target.bak.$TS"
+    fi
+    ln -sf "$f" "$target"
+  done
+}
+link_folder "$SRC/agents"   "$DEST/agents"
+link_folder "$SRC/commands" "$DEST/commands"
 
-for f in "$SRC"/commands/*.md; do mkdir -p "$DEST/commands"; ln -sf "$f" "$DEST/commands/$(basename "$f")"; done
+# O modelo mostrado ao abrir o OpenClaude vem do PERFIL de provedor de cada PC,
+# não do settings.json. Aqui o perfil ativo é alinhado ao "model" do time.
+sync_profile_model() {
+  command -v jq >/dev/null 2>&1 || {
+    echo "AVISO: 'jq' não encontrado; o modelo padrão do perfil não foi sincronizado."
+    return 0
+  }
+  local model main prof tmp cur
+  model="$(jq -r '.model // empty' "$CFG")"
+  [ -n "$model" ] || return 0
+  main="$HOME/.openclaude.json"
+  prof="$DEST/.openclaude-profile.json"
+
+  # Perfil ativo existe e tem outro modelo? Só então altera (e guarda backup).
+  if [ -f "$main" ]; then
+    cur="$(jq -r '(.activeProviderProfileId // "") as $id
+                  | [.providerProfiles[]? | select(.id == $id)] | if length == 0 then "NONE" else (.[0].model // "") end' "$main" 2>/dev/null || echo NONE)"
+    if [ "$cur" != "NONE" ] && [ "$cur" != "$model" ]; then
+      tmp="$(mktemp)"
+      jq --arg m "$model" '(.activeProviderProfileId // "") as $id
+          | .providerProfiles |= map(if .id == $id then .model = $m else . end)' "$main" > "$tmp"
+      cp "$main" "$main.bak.$TS"
+      mv "$tmp" "$main"
+      echo "Modelo padrão do perfil ativo em ~/.openclaude.json: ${cur:-vazio} -> $model"
+    fi
+  fi
+
+  if [ -f "$prof" ]; then
+    cur="$(jq -r '.env.OPENAI_MODEL // "NONE"' "$prof" 2>/dev/null || echo NONE)"
+    if [ "$cur" != "NONE" ] && [ "$cur" != "$model" ]; then
+      tmp="$(mktemp)"
+      jq --arg m "$model" '.env.OPENAI_MODEL = $m' "$prof" > "$tmp"
+      cp "$prof" "$prof.bak.$TS"
+      mv "$tmp" "$prof"
+      echo "OPENAI_MODEL em .openclaude-profile.json: $cur -> $model"
+    fi
+  fi
+}
+sync_profile_model
+
 echo "Time '$TEAM' instalado em $DEST (backup do settings anterior salvo)."
 
 # Verificações que já causaram problema
